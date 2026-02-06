@@ -1,0 +1,9 @@
+{
+  "exclude": [
+    "outputs",
+    "outputs_debug",
+    "checkpoints",
+    "data",
+    "*.log"
+  ]
+}

@@ -1,159 +1,56 @@
-# Autoregressive Image Generation without Vector Quantization <br><sub>Official PyTorch Implementation</sub>
+# Dynamic Autoregressive Image Generation
 
-[![arXiv](https://img.shields.io/badge/arXiv%20paper-2406.11838-b31b1b.svg)](https://arxiv.org/abs/2406.11838)&nbsp;
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/autoregressive-image-generation-without/image-generation-on-imagenet-256x256)](https://paperswithcode.com/sota/image-generation-on-imagenet-256x256?p=autoregressive-image-generation-without)
-[![Colab](https://colab.research.google.com/assets/colab-badge.svg)](http://colab.research.google.com/github/LTH14/mar/blob/main/demo/run_mar.ipynb)
-[![huggingface](https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-mar-yellow)](https://huggingface.co/jadechoghari/mar)&nbsp;
+## Abstract
 
-<p align="center">
-  <img src="demo/visual.png" width="720">
-</p>
+Autoregressive Image generation with transformer-based models is constrained by tokenization strategies that lead to a quadratic increase in token count with increasing image resolution. We propose **DyART** (Dynamic Autoregressive Transformer), a novel approach for reducing token count by leveraging spatial redundancy in images to dynamically merge tokens into larger units, or patches, guided by next-token prediction entropy. Our method achieves a reduced sub-quadratic growth in patch count with increasing resolution on the ImageNet benchmark, demonstrating improved computational efficiency. Further, we introduce a ROPE-based positional encoding scheme for dynamically sized patches, capturing spatial proximity across variable-length patches. Finally, we validate the scalability of our approach by training models from 120M to 1.3B parameters, achieving faster convergence and improved FID on the ImageNet benchmark. Our approach can be integrated with existing discrete 2D tokenizers, making it compatible with existing autoregressive image generation architectures and opening new avenues for efficient training of multimodal large language models.
 
-This is a PyTorch/GPU implementation of the paper [Autoregressive Image Generation without Vector Quantization](https://arxiv.org/abs/2406.11838) (Neurips 2024 Spotlight Presentation):
+## Quick start
 
-```
-@article{li2024autoregressive,
-  title={Autoregressive Image Generation without Vector Quantization},
-  author={Li, Tianhong and Tian, Yonglong and Li, He and Deng, Mingyang and He, Kaiming},
-  journal={arXiv preprint arXiv:2406.11838},
-  year={2024}
-}
+1. Run these commands to setup environment:
+
+```bash
+conda create -n llamagen python=3.13
+conda activate llamagen
+pip install -r requirements.txt
 ```
 
-This repo contains:
+2. Symlink to folder containing data, entropy model for patching, and evaluation artifacts:
 
-* 🪐 A simple PyTorch implementation of [MAR](models/mar.py) and [DiffLoss](models/diffloss.py)
-* ⚡️ Pre-trained class-conditional MAR models trained on ImageNet 256x256
-* 💥 A self-contained [Colab notebook](http://colab.research.google.com/github/LTH14/mar/blob/main/demo/run_mar.ipynb) for running various pre-trained MAR models
-* 🛸 An MAR+DiffLoss [training and evaluation script](main_mar.py) using PyTorch DDP
-* 🎉 Also checkout our [Hugging Face model cards](https://huggingface.co/jadechoghari/mar) and [Gradio demo](https://huggingface.co/spaces/jadechoghari/mar) (thanks [@jadechoghari](https://github.com/jadechoghari)).
-
-## Preparation
-
-### Dataset
-Download [ImageNet](http://image-net.org/download) dataset, and place it in your `IMAGENET_PATH`.
-
-### Installation
-
-Download the code:
-```
-git clone https://github.com/LTH14/mar.git
-cd mar
+```bash
+ln -s /mnt/sandbox/dsriv/dynamic_tokenization/data data
 ```
 
-A suitable [conda](https://conda.io/) environment named `mar` can be created and activated with:
+3. Sample few images from DGPT-L(~375M params) model:
 
-```
-conda env create -f environment.yaml
-conda activate mar
-```
-
-Download pre-trained VAE and MAR models:
-
-```
-python util/download.py
+```bash
+python sample_c2i.py --experiment_dir data/model_checkpoints/global_model_entropy_row_break_b/20250820_13/ --output-dir samples
 ```
 
-For convenience, our pre-trained MAR models can be downloaded directly here as well:
+## Training
 
-| MAR Model                                                              | FID-50K | Inception Score | #params | 
-|------------------------------------------------------------------------|---------|-----------------|---------|
-| [MAR-B](https://www.dropbox.com/scl/fi/f6dpuyjb7fudzxcyhvrhk/checkpoint-last.pth?rlkey=a6i4bo71vhfo4anp33n9ukujb&dl=0) | 2.31    | 281.7           | 208M    |
-| [MAR-L](https://www.dropbox.com/scl/fi/pxacc5b2mrt3ifw4cah6k/checkpoint-last.pth?rlkey=m48ovo6g7ivcbosrbdaz0ehqt&dl=0) | 1.78    | 296.0           | 479M    |
-| [MAR-H](https://www.dropbox.com/scl/fi/1qmfx6fpy3k7j9vcjjs3s/checkpoint-last.pth?rlkey=4lae281yzxb406atp32vzc83o&dl=0) | 1.55    | 303.7           | 943M    |
+Run the following command to train DGPT-L model for image resolution 256 on 4x40G GPUs:
 
-### (Optional) Caching VAE Latents
-
-Given that our data augmentation consists of simple center cropping and random flipping, 
-the VAE latents can be pre-computed and saved to `CACHED_PATH` to save computations during MAR training:
-
-```
-torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
-main_cache.py \
---img_size 256 --vae_path pretrained_models/vae/kl16.ckpt --vae_embed_dim 16 \
---batch_size 128 \
---data_path ${IMAGENET_PATH} --cached_path ${CACHED_PATH}
+```bash
+accelerate launch --multi-gpu train_global_model.py --config configs/patching_modes/global_model_entropy_row_break.yaml --model.gpt_model DGPT-L --patcher.entropy_model_checkpoint_config data/entropy_model/20250808_11/config.yaml --patcher.entropy_model_checkpoint data/entropy_model/20250808_11/checkpoints/epoch_00000299/model.safetensors --prod
 ```
 
-## Usage
+**Note**: We currently have two entropy models under `data/entropy_model` trained for image resolution 256 and 384:
 
-### Demo
-Run our interactive visualization [demo](http://colab.research.google.com/github/LTH14/mar/blob/main/demo/run_mar.ipynb) using Colab notebook!
+| Resolution | Folder      |
+| ---------- | ----------- |
+| 256        | 20250808_11 |
+| 384        | 20250810_21 |
 
-### Local Gradio App
+## Evaluation
 
-```
-python demo/gradio_app.py 
-```
+1. Generate 50,000 image samples for FID-50K evaluation and pack generated images into a `.npz` file for use with evaluation script:
 
-
-
-### Training
-Script for the default setting (MAR-L, DiffLoss MLP with 3 blocks and a width of 1024 channels, 400 epochs):
-```
-torchrun --nproc_per_node=8 --nnodes=4 --node_rank=${NODE_RANK} --master_addr=${MASTER_ADDR} --master_port=${MASTER_PORT} \
-main_mar.py \
---img_size 256 --vae_path pretrained_models/vae/kl16.ckpt --vae_embed_dim 16 --vae_stride 16 --patch_size 1 \
---model mar_large --diffloss_d 3 --diffloss_w 1024 \
---epochs 400 --warmup_epochs 100 --batch_size 64 --blr 1.0e-4 --diffusion_batch_mul 4 \
---output_dir ${OUTPUT_DIR} --resume ${OUTPUT_DIR} \
---data_path ${IMAGENET_PATH}
-```
-- Training time is ~1d7h on 32 H100 GPUs with `--batch_size 64`.
-- Add `--online_eval` to evaluate FID during training (every 40 epochs).
-- (Optional) To train with cached VAE latents, add `--use_cached --cached_path ${CACHED_PATH}` to the arguments. 
-Training time with cached latents is ~1d11h on 16 H100 GPUs with `--batch_size 128` (nearly 2x faster than without caching).
-- (Optional) To save GPU memory during training by using gradient checkpointing (thanks to @Jiawei-Yang), add `--grad_checkpointing` to the arguments. 
-Note that this may slightly reduce training speed.
-
-### Evaluation (ImageNet 256x256)
-
-Evaluate MAR-B (DiffLoss MLP with 6 blocks and a width of 1024 channels, 800 epochs) with classifier-free guidance:
-```
-torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
-main_mar.py \
---model mar_base --diffloss_d 6 --diffloss_w 1024 \
---eval_bsz 256 --num_images 50000 \
---num_iter 256 --num_sampling_steps 100 --cfg 2.9 --cfg_schedule linear --temperature 1.0 \
---output_dir pretrained_models/mar/mar_base \
---resume pretrained_models/mar/mar_base \
---data_path ${IMAGENET_PATH} --evaluate
+```bash
+accelerate launch sample_c2i_ddp.py --experiment_dir data/model_checkpoints/global_model_entropy_row_break_b/20250820_13/ --cfg-scale 2.0 --output-dir samples
 ```
 
-Evaluate MAR-L (DiffLoss MLP with 8 blocks and a width of 1280 channels, 800 epochs) with classifier-free guidance:
+2. Run evaluation script to calculate `FID`, `IS`, `sFID`, `precision`, and, `recall`:
+
+```bash
+python -m evaluations.c2i.evaluator data/VIRTUAL_imagenet256_labeled.npz samples/epoch-299-topk-0-topp-1.0-temperature-1.0-cfg-2.0-seed-0.npz
 ```
-torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
-main_mar.py \
---model mar_large --diffloss_d 8 --diffloss_w 1280 \
---eval_bsz 256 --num_images 50000 \
---num_iter 256 --num_sampling_steps 100 --cfg 3.0 --cfg_schedule linear --temperature 1.0 \
---output_dir pretrained_models/mar/mar_large \
---resume pretrained_models/mar/mar_large \
---data_path ${IMAGENET_PATH} --evaluate
-```
-
-Evaluate MAR-H (DiffLoss MLP with 12 blocks and a width of 1536 channels, 800 epochs) with classifier-free guidance:
-```
-torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
-main_mar.py \
---model mar_huge --diffloss_d 12 --diffloss_w 1536 \
---eval_bsz 128 --num_images 50000 \
---num_iter 256 --num_sampling_steps 100 --cfg 3.2 --cfg_schedule linear --temperature 1.0 \
---output_dir pretrained_models/mar/mar_huge \
---resume pretrained_models/mar/mar_huge \
---data_path ${IMAGENET_PATH} --evaluate
-```
-
-- Set `--cfg 1.0 --temperature 0.95` to evaluate without classifier-free guidance.
-- Generation speed can be significantly increased by reducing the number of autoregressive iterations (e.g., `--num_iter 64`).
-
-## Acknowledgements
-We thank Congyue Deng and Xinlei Chen for helpful discussion. We thank
-Google TPU Research Cloud (TRC) for granting us access to TPUs, and Google Cloud Platform for
-supporting GPU resources.
-
-A large portion of codes in this repo is based on [MAE](https://github.com/facebookresearch/mae), [MAGE](https://github.com/LTH14/mage) and [DiT](https://github.com/facebookresearch/DiT).
-
-## Contact
-
-If you have any questions, feel free to contact me through email (tianhong@mit.edu). Enjoy!

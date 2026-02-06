@@ -1,0 +1,4 @@
+Image, Source
+low-detail.jpg, https://images.pexels.com/photos/281260/pexels-photo-281260.jpeg?cs=srgb&dl=pexels-francesco-ungaro-281260.jpg&fm=jpg&_gl=1*90rrfr*_ga*MjEwMzQ5NTY1NS4xNzYyMjI2NTQx*_ga_8JE65Q40S6*czE3NjIyMjY1NDAkbzEkZzEkdDE3NjIyMjY1NzIkajI4JGwwJGgw
+medium-detail, https://www.pexels.com/photo/ocean-view-during-daylight-127673/
+high-detail.jpg, https://images.pexels.com/photos/13600865/pexels-photo-13600865.jpeg?cs=srgb&dl=pexels-kordanalev-274126666-13600865.jpg&fm=jpg&_gl=1*f52p3b*_ga*MjEwMzQ5NTY1NS4xNzYyMjI2NTQx*_ga_8JE65Q40S6*czE3NjIyMjY1NDAkbzEkZzEkdDE3NjIyMjcxMTYkajQ0JGwwJGgw

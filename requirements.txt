@@ -1,0 +1,14 @@
+torch
+torchvision
+omegaconf
+wandb
+matplotlib
+accelerate
+tensorboard
+matplotlib
+seaborn
+pytorch_fid
+opencv-python
+pynvml
+tensorflow[and-cuda]
+xformers --index-url https://download.pytorch.org/whl/cu128
