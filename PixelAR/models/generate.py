@@ -4,7 +4,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from dynamic_tokenization.models.patcher import Patcher
+from PixelAR.models.patcher import Patcher
 from accelerate.utils.tqdm import tqdm
 # torch._inductor.config.coordinate_descent_tuning = True
 # torch._inductor.config.triton.unique_kernel_names = True

@@ -12,7 +12,7 @@ from omegaconf import OmegaConf
 from pydantic import BaseModel
 from enum import Enum
 
-from dynamic_tokenization.models.gpt import GPT_models
+from PixelAR.models.gpt import GPT_models
 
 
 class PatchingModeEnum(str, Enum):

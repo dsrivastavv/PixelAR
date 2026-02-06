@@ -8,7 +8,7 @@ from PIL import Image
 from pytorch_fid.fid_score import calculate_fid_given_paths, save_fid_stats
 from torchvision import transforms
 
-from dynamic_tokenization.utils.image import (
+from PixelAR.utils.image import (
     center_crop_arr,
     concatenate_images_horizontally,
     decode_codes_to_img,

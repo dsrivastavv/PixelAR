@@ -7,16 +7,16 @@ from pathlib import Path
 import torch
 import gc
 
-from dynamic_tokenization.dataset.imagenet import CustomDataset
-from dynamic_tokenization.dataset.patch_dataset import PatchDataset, collate_fn as patch_collate_fn
-from dynamic_tokenization.evaluation.evaluate import evaluate_reconstruction
-from dynamic_tokenization.models.dynamic_gpt import DGPT_models
-from dynamic_tokenization.models.patcher import PatcherArgs
-from dynamic_tokenization.models.utils import save_with_retries
-from dynamic_tokenization.tokenizer_image.vq_model import VQ_models
-from dynamic_tokenization.utils.conf import setup_default_config_values
-from dynamic_tokenization.utils.gpu_monitor import GPUMemoryMonitor
-from dynamic_tokenization.utils.logger import create_logger
+from PixelAR.dataset.imagenet import CustomDataset
+from PixelAR.dataset.patch_dataset import PatchDataset, collate_fn as patch_collate_fn
+from PixelAR.evaluation.evaluate import evaluate_reconstruction
+from PixelAR.models.dynamic_gpt import DGPT_models
+from PixelAR.models.patcher import PatcherArgs
+from PixelAR.models.utils import save_with_retries
+from PixelAR.tokenizer_image.vq_model import VQ_models
+from PixelAR.utils.conf import setup_default_config_values
+from PixelAR.utils.gpu_monitor import GPUMemoryMonitor
+from PixelAR.utils.logger import create_logger
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True

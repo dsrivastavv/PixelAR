@@ -5,14 +5,14 @@
 import gc
 import torch
 
-from dynamic_tokenization.dataset.imagenet import CustomDataset
-from dynamic_tokenization.dataset.patch_dataset import PatchDataset
-from dynamic_tokenization.evaluation.evaluate import evaluate_reconstruction
-from dynamic_tokenization.models.gpt import GPT_models
-from dynamic_tokenization.models.utils import save_with_retries
-from dynamic_tokenization.tokenizer_image.vq_model import VQ_models
-from dynamic_tokenization.utils.gpu_monitor import GPUMemoryMonitor
-from dynamic_tokenization.utils.logger import create_logger
+from PixelAR.dataset.imagenet import CustomDataset
+from PixelAR.dataset.patch_dataset import PatchDataset
+from PixelAR.evaluation.evaluate import evaluate_reconstruction
+from PixelAR.models.gpt import GPT_models
+from PixelAR.models.utils import save_with_retries
+from PixelAR.tokenizer_image.vq_model import VQ_models
+from PixelAR.utils.gpu_monitor import GPUMemoryMonitor
+from PixelAR.utils.logger import create_logger
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True

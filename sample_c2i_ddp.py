@@ -7,13 +7,13 @@ import math
 import torch
 import torch.nn.functional as F
 
-from dynamic_tokenization.models.generate import generate, generate_dynamic, generate_llamagen
-from dynamic_tokenization.models.gpt import GPT_models
-from dynamic_tokenization.models.dynamic_gpt import DGPT_models
-from dynamic_tokenization.models.patcher import PatcherArgs
-from dynamic_tokenization.tokenizer_image.vq_model import VQ_models
-from dynamic_tokenization.utils.conf import setup_default_config_values
-from dynamic_tokenization.utils.logger import create_logger
+from PixelAR.models.generate import generate, generate_dynamic, generate_llamagen
+from PixelAR.models.gpt import GPT_models
+from PixelAR.models.dynamic_gpt import DGPT_models
+from PixelAR.models.patcher import PatcherArgs
+from PixelAR.tokenizer_image.vq_model import VQ_models
+from PixelAR.utils.conf import setup_default_config_values
+from PixelAR.utils.logger import create_logger
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True

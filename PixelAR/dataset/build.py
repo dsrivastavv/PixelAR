@@ -1,5 +1,5 @@
-from dynamic_tokenization.dataset.imagenet import build_imagenet, build_imagenet_code
-from dynamic_tokenization.dataset.coco import build_coco
+from PixelAR.dataset.imagenet import build_imagenet, build_imagenet_code
+from PixelAR.dataset.coco import build_coco
 
 
 def build_dataset(args, **kwargs):

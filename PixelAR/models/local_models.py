@@ -8,8 +8,8 @@ from enum import Enum
 
 from torch.utils.checkpoint import checkpoint
 
-from dynamic_tokenization.models.gpt import apply_rotary_emb, get_start_pos_from_seqlens, map_pos_to_freq, precompute_freqs_cis_2d, TransformerBlock, RMSNorm
-from dynamic_tokenization.models.patcher import create_patch_mask_from_ids
+from PixelAR.models.gpt import apply_rotary_emb, get_start_pos_from_seqlens, map_pos_to_freq, precompute_freqs_cis_2d, TransformerBlock, RMSNorm
+from PixelAR.models.patcher import create_patch_mask_from_ids
 from xformers.ops import fmha, LowerTriangularMask
 from xformers.ops import fmha, LowerTriangularMask
 from xformers.ops.fmha import MemoryEfficientAttentionCutlassOp

@@ -5,8 +5,8 @@ import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
-from dynamic_tokenization.dataset.imagenet import CustomDataset
-from dynamic_tokenization.models.patcher import Patcher
+from PixelAR.dataset.imagenet import CustomDataset
+from PixelAR.models.patcher import Patcher
 
 
 class PatchDataset(Dataset):

@@ -16,9 +16,9 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
-from dynamic_tokenization.models.local_models import DecoderModelArgs, EncoderModelArgs, LocalEncoder, LocalDecoder, cross_attn_mask
-from dynamic_tokenization.models.patcher import patch_ids_from_lengths
-from dynamic_tokenization.models.gpt import RMSNorm, get_start_pos_from_seqlens, precompute_freqs_cis, precompute_freqs_cis_2d, LabelEmbedder, TransformerBlock, scatter_at_pos, map_pos_to_freq
+from PixelAR.models.local_models import DecoderModelArgs, EncoderModelArgs, LocalEncoder, LocalDecoder, cross_attn_mask
+from PixelAR.models.patcher import patch_ids_from_lengths
+from PixelAR.models.gpt import RMSNorm, get_start_pos_from_seqlens, precompute_freqs_cis, precompute_freqs_cis_2d, LabelEmbedder, TransformerBlock, scatter_at_pos, map_pos_to_freq
 from typing import Optional
 
 

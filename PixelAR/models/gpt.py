@@ -12,7 +12,7 @@ from typing import Optional, List
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from dynamic_tokenization.models.drop_path import DropPath
+from PixelAR.models.drop_path import DropPath
 from xformers.ops import fmha, LowerTriangularMask
 from xformers.ops.fmha import MemoryEfficientAttentionCutlassOp
 from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
