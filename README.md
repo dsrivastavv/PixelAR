@@ -9,8 +9,8 @@ Autoregressive Image generation with transformer-based models is constrained by 
 1. Run these commands to setup environment:
 
 ```bash
-conda create -n llamagen python=3.13
-conda activate llamagen
+conda create -n pixelar python=3.13
+conda activate pixelar
 pip install -r requirements.txt
 ```
 
