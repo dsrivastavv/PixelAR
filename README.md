@@ -11,6 +11,7 @@ Autoregressive Image generation with transformer-based models is constrained by 
 ```bash
 conda create -n pixelar python=3.13
 conda activate pixelar
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 pip install -r requirements.txt
 ```
 

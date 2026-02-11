@@ -19,41 +19,19 @@ from PixelAR.utils.image import (
 
 @torch.no_grad()
 def evaluate_reconstruction(
-    vq_model, pred_logits, gt_tokens, num_img_visualize, image_size, codebook_embed_dim, no_cond=False, device="cpu"
+    pred_logits, gt_tokens, num_img_visualize, image_size, codebook_embed_dim, no_cond=False, device="cpu"
 ):
     """Evaluate model reconstruction performance."""
     # get logits of the current batch
     pred_logits = pred_logits[:num_img_visualize]
     gt_tokens = gt_tokens[:num_img_visualize]
 
-    # teacher forcing reconstruction
-    start_idx = 0
-    img_token_num = pred_logits.shape[1]
-    if no_cond:
-        pred_recon_indices = torch.zeros(num_img_visualize, img_token_num+1, device=device).long()
-        pred_recon_indices[:, 0] = gt_tokens[:, 0]
-        for i in range(start_idx, img_token_num):
-            pred_recon_indices[:, i+1 : i+2] = torch.argmax(pred_logits[:, i : i + 1], dim=-1)
-    else:
-        pred_recon_indices = torch.zeros(num_img_visualize, img_token_num, device=device).long()
-        for i in range(start_idx, img_token_num):
-            pred_recon_indices[:, i : i + 1] = torch.argmax(pred_logits[:, i : i + 1], dim=-1)
+    # teacher forcing reconstruction    
+    pred_recon_imgs = pred_logits.argmax(dim=-1).cpu().numpy().transpose(0, 2, 3, 1) / 255.0 # [num_img_visualize, C, H, W]
+    gt_recon_imgs = gt_tokens.cpu().numpy().transpose(0, 2, 3, 1) / 255.0 # [num_img_visualize, C, H, W]
     
-    pred_recon_imgs = decode_codes_to_img(
-        vq_model,
-        pred_recon_indices,
-        image_size,
-        codebook_embed_dim=codebook_embed_dim,
-    )
-    pred_recon_grid = make_grid(pred_recon_imgs)
-
-    # vq reconstruction
-    gt_recon_imgs = decode_codes_to_img(
-        vq_model,
-        gt_tokens,
-        image_size,
-        codebook_embed_dim=codebook_embed_dim,
-    )
+    # grid visualization
+    pred_recon_grid = make_grid(pred_recon_imgs)   
     gt_recon_grid = make_grid(gt_recon_imgs)
 
     return pred_recon_grid, gt_recon_grid
