@@ -18,8 +18,18 @@ from PixelAR.utils.image import (
 
 
 @torch.no_grad()
+def tokens_to_images(tokens, patch_size):
+    # tokens: [B, T, 3, patch_size, patch_size]
+    B = tokens.shape[0]
+    H_ = W_ = int(tokens.shape[1] ** 0.5)
+    images = tokens.reshape(B, H_, W_, 3, patch_size, patch_size)
+    images = torch.einsum('nhwcpq->nchpwq', images)
+    images = images.reshape(B, 3, H_ * patch_size, W_ * patch_size).contiguous() # [B, 3, H, W]
+    return images
+
+@torch.no_grad()
 def evaluate_reconstruction(
-    vq_model, pred_logits, gt_tokens, num_img_visualize, image_size, codebook_embed_dim, no_cond=False, device="cpu"
+    pred_logits, gt_tokens, num_img_visualize, patch_size=16
 ):
     """Evaluate model reconstruction performance."""
     # get logits of the current batch
@@ -27,33 +37,12 @@ def evaluate_reconstruction(
     gt_tokens = gt_tokens[:num_img_visualize]
 
     # teacher forcing reconstruction
-    start_idx = 0
-    img_token_num = pred_logits.shape[1]
-    if no_cond:
-        pred_recon_indices = torch.zeros(num_img_visualize, img_token_num+1, device=device).long()
-        pred_recon_indices[:, 0] = gt_tokens[:, 0]
-        for i in range(start_idx, img_token_num):
-            pred_recon_indices[:, i+1 : i+2] = torch.argmax(pred_logits[:, i : i + 1], dim=-1)
-    else:
-        pred_recon_indices = torch.zeros(num_img_visualize, img_token_num, device=device).long()
-        for i in range(start_idx, img_token_num):
-            pred_recon_indices[:, i : i + 1] = torch.argmax(pred_logits[:, i : i + 1], dim=-1)
+    pred_recon_imgs = pred_logits.argmax(dim=-1).cpu()
+    pred_recon_imgs = tokens_to_images(pred_recon_imgs, patch_size=patch_size).numpy().transpose(0, 2, 3, 1) / 255.0 # [num_img_visualize, H, W, C]
+    gt_recon_imgs = tokens_to_images(gt_tokens.cpu(), patch_size=patch_size).numpy().transpose(0, 2, 3, 1) / 255.0 # [num_img_visualize, H, W, C]
     
-    pred_recon_imgs = decode_codes_to_img(
-        vq_model,
-        pred_recon_indices,
-        image_size,
-        codebook_embed_dim=codebook_embed_dim,
-    )
-    pred_recon_grid = make_grid(pred_recon_imgs)
-
-    # vq reconstruction
-    gt_recon_imgs = decode_codes_to_img(
-        vq_model,
-        gt_tokens,
-        image_size,
-        codebook_embed_dim=codebook_embed_dim,
-    )
+    # grid visualization
+    pred_recon_grid = make_grid(pred_recon_imgs)   
     gt_recon_grid = make_grid(gt_recon_imgs)
 
     return pred_recon_grid, gt_recon_grid

@@ -1,0 +1,2 @@
+1. ln -s /mnt/ultracube/datasets/imagenet data
+2. accelerate launch train.py --prod 

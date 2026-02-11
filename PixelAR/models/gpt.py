@@ -14,113 +14,11 @@ import torch.nn as nn
 from torch.nn import functional as F
 from PixelAR.models.drop_path import DropPath
 from xformers.ops import fmha, LowerTriangularMask
-from xformers.ops.fmha import MemoryEfficientAttentionCutlassOp
-from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
-
-@torch.compiler.disable
-def _call_xformers_attention(
-    seqlens: torch.Tensor,
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    xv: torch.Tensor,
-    attn_dropout_p: float = 0.0,
-):
-    seqlens_cpu = seqlens.detach().to(dtype=torch.int32)
-    attn_bias = BlockDiagonalCausalMask.from_seqlens(
-        seqlens_cpu.tolist(),
-        device=xq.device,
-    )
-    return fmha.memory_efficient_attention(
-        xq,
-        xk,
-        xv,
-        attn_bias=attn_bias,
-        p=attn_dropout_p,
-        op=MemoryEfficientAttentionCutlassOp,
-    )
 
 def find_multiple(n: int, k: int):
     if n % k == 0:
         return n
     return n + k - (n % k)
-
-
-@torch.no_grad()
-def map_pos_to_freq(seqlens: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    # seqlens: [num_blocks] (int64), freqs_cis: [max_T, ...] (any dtype incl. complex/bf16)
-    seqlens = seqlens.to(torch.long)
-    total = seqlens.sum()
-
-    start_offsets = torch.cumsum(seqlens, dim=0) - seqlens  # [num_blocks], int64
-    per_token_offsets = torch.repeat_interleave(start_offsets, seqlens)  # [total], int64
-    global_index = torch.arange(total, device=seqlens.device)  # [total], int64
-    relative_index = global_index - per_token_offsets  # [total], int64
-    return torch.index_select(freqs_cis, dim=0, index=relative_index)
-
-
-
-def scatter_at_pos(input: torch.Tensor, data: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
-    """
-    Insert `data` rows into a new tensor at output indices `pos`, preserving the
-    original order of `input` for the remaining slots.
-
-    Args:
-        input: [T1, D]  (base sequence, any floating dtype incl. bf16/fp16/fp32)
-        data:  [T2, D]  (rows to insert; will be cast to input.dtype)
-        pos:   [T2]     (indices in range [0, T1 + T2), unique; where to place `data`)
-
-    Returns:
-        output: [T1 + T2, D]
-    """
-    T1, D = input.shape
-    T2 = data.shape[0]
-    device = input.device
-    dtype = input.dtype
-
-    pos = pos.to(device=device, dtype=torch.long).flatten()
-    
-    # light runtime guards (kept tensor-y to be compile-friendly)
-    assert pos.numel() == T2, "Position tensor must align with data length"
-    
-    # (Optional) uniqueness/range checks could be added if needed.
-
-    T = T1 + T2
-
-    # mask for where data goes
-    data_mask = torch.zeros(T, dtype=torch.bool, device=device)
-    data_mask[pos] = True
-    input_mask = ~data_mask  # where input should fill, preserving order
-
-    # prefix ranks: for each output position, what's the 0-based index we should take from input/data?
-    in_rank  = torch.cumsum(input_mask.to(torch.int64), dim=0) - 1   # [-1 .. T1-1]
-    dt_rank  = torch.cumsum(data_mask.to(torch.int64),  dim=0) - 1   # [-1 .. T2-1]
-
-    # clamp negatives so gathers are always valid (values at those places will be discarded by where)
-    in_rank  = torch.clamp(in_rank, min=0)
-    dt_rank  = torch.clamp(dt_rank, min=0)
-
-    # gather rows (shape: [T, D])
-    picked_input = input[in_rank]                      # bf16-safe gather
-    picked_data  = data[dt_rank].to(dtype)             # cast once to match AMP dtype
-
-    # select per position without in-place writes / advanced index-put
-    output = torch.where(input_mask.unsqueeze(1), picked_input, picked_data)
-    return output
-
-@torch.no_grad()
-def get_start_pos_from_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
-    """
-    Given a tensor of sequence lengths, return the start positions for each sequence.
-
-    Args:
-        seqlens: [B] (int64) tensor of sequence lengths
-
-    Returns:
-        start_pos: [B] (int64) tensor of start positions
-    """
-    assert seqlens.dim() == 1, "seqlens must be a 1D tensor"
-    start_pos = torch.cumsum(seqlens, dim=-1) - seqlens
-    return start_pos
 
 @dataclass
 class ModelArgs:
@@ -145,30 +43,147 @@ class ModelArgs:
     class_dropout_prob: float = 0.1
     model_type: str = 'c2i'
 
-    vocab_size: int = 16384
+    vocab_size: int = 256
+    vocab_embed_dim: int = 8
     cls_token_num: int = 1
+    patch_size: int = 16
     block_size: int = 256
     max_batch_size: int = 32
-    max_seq_len: int = 2048
-
-    packed_inputs: bool = False
+    max_seq_len: int = 256
+    
+    patchifier: str = 'linear' # [linear, cnn]
 
 
 #################################################################################
-#                      Embedding Layers for no Class Labels                        #
+#                      Patchfication Schemes for Image                          #
 #################################################################################
-class UcondEmbedder(nn.Module):
-    """
-    Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
-    """
-    def __init__(self, hidden_size):
+
+class BasePatchifier(nn.Module):
+    def __init__(self, patch_size):
         super().__init__()
-        self.hidden_size = hidden_size
+        self.patch_size = patch_size
 
-    def forward(self, labels, train, force_drop_ids=None):
-        embeddings = torch.empty((labels.shape[0], 0, self.hidden_size), device=labels.device)
-        return embeddings
+    def patchify(self, x):
+        raise NotImplementedError
 
+    def unpatchify(self, x):
+        raise NotImplementedError
+    
+    
+class LinearPatchifier(BasePatchifier):
+    def __init__(self, patch_size, vocab_embed_dim, dim):
+        super().__init__(patch_size)
+        self.patch_embed = nn.Linear(patch_size**2*3*vocab_embed_dim, dim, bias=False)
+        self.patch_unembed = nn.Linear(dim, patch_size**2*3*vocab_embed_dim, bias=False)
+        
+    def patchify(self, x):
+        '''
+        x: [B, T, patch_size, patch_size, 3*embed_dim]
+        out: [B, L, D]
+        '''
+        x = x.view(x.shape[0], x.shape[1], -1) # [B, T, patch_size**2*3*embed_dim]
+        x = self.patch_embed(x)
+        return x  # [B, T, D]
+    
+    def unpatchify(self, x):
+        """
+        x: (N, T, D)
+        imgs: (N, T, 3, patch_size, patch_size, embed_dim]
+        """
+        x = self.patch_unembed(x) # [B, T, 3*embed_dim*patch_size**2]
+        x = x.view(x.shape[0], x.shape[1], self.patch_size, self.patch_size, 3, -1) # [B, T, patch_size, patch_size, 3, embed_dim]
+        x = torch.einsum('btpqce->btcpqe', x) # [B, T, 3, patch_size, patch_size, embed_dim]
+        return x
+    
+    
+class CNNPatchifier(BasePatchifier):
+    def __init__(self, patch_size, vocab_embed_dim, dim):
+        super().__init__(patch_size)
+        self.patch_embed = nn.Conv2d(3*vocab_embed_dim, dim, kernel_size=patch_size, stride=patch_size, bias=False)
+        self.patch_unembed = nn.ConvTranspose2d(dim, 3*vocab_embed_dim, kernel_size=patch_size, stride=patch_size, bias=False)
+    
+    def patchify(self, x):
+        '''
+        x: [B, T, patch_size, patch_size, 3*embed_dim]
+        out: [B, L, D]
+        '''
+        bsz, T, _, _, _ = x.shape
+        x = x.flatten(0,1) # [B*T, patch_size, patch_size, 3*embed_dim]
+        x = torch.einsum('bpqd->bdpq', x) # [B*T, 3*embed_dim, patch_size, patch_size]
+        x = self.patch_embed(x) # [B*T, D, 1, 1]
+        x = x.view(bsz, T, -1).contiguous() # [B, T, D]
+        return x
+    
+    def unpatchify(self, x):
+        """
+        x: (N, T, D)
+        imgs: (N, T, 3, patch_size, patch_size, embed_dim]
+        """
+        bsz, T, _ = x.shape
+        x = x.view(bsz*T, -1)[:, :, None, None] # [B*T, D, 1, 1]
+        x = self.patch_unembed(x) # [B*T, 3*embed_dim, patch_size, patch_size]
+        x = torch.einsum('bdpq->bpqd', x) # [B*T, patch_size, patch_size, 3*embed_dim]
+        x = x.view(bsz, T, self.patch_size, self.patch_size, 3, -1) # [B, T, patch_size, patch_size, 3, embed_dim]
+        x = torch.einsum('btpqce->btcpqe', x).contiguous() # [B, T, 3, patch_size, patch_size, embed_dim]
+        return x
+
+# self.inp_proj = nn.Linear(config.vocab_embed_dim*3*config.patch_size**2, config.dim, bias=False)
+        # # self.patch_embed = PatchEmbed(
+        # #     img_size=config.image_size, 
+        # #     patch_size=config.patch_size, 
+        # #     in_chans=config.vocab_embed_dim*3, 
+        # #     embed_dim=config.dim, 
+        # #     bias=True
+        # # )
+        # self.patch_embed = nn.Conv2d(3*config.vocab_embed_dim, config.dim, kernel_size=config.patch_size, stride=config.patch_size, bias=False)
+
+# emb = torch.stack([
+            #     self.r_embeddings(idx[:,0]),
+            #     self.g_embeddings(idx[:,1]),
+            #     self.b_embeddings(idx[:,2])
+            # ], dim=-2)  # [B,H,W,3,v_dim]
+            # emb = self.r_embeddings(idx)
+            # token_embeddings = torch.empty(idx.shape[0], idx.shape[2], idx.shape[3], self.config.vocab_embed_dim*3, device=idx.device)
+            # token_embeddings[:, :, :, :self.config.vocab_embed_dim] = self.r_embeddings(idx[:, 0])
+            # token_embeddings[:, :, :, self.config.vocab_embed_dim:2*self.config.vocab_embed_dim] = self.g_embeddings(idx[:, 1])
+            # token_embeddings[:, :, :, 2*self.config.vocab_embed_dim:] = self.b_embeddings(idx[:, 2])
+
+            # # token_embeddings = emb.reshape(emb.shape[0], emb.shape[1], emb.shape[2], -1) # [B, H, W, 3*v_dim]
+            # token_embeddings = torch.einsum('bhwc->bchw', token_embeddings) # [B, 3*v_dim, H, W]
+            # bsz, T, _, _, _ = token_embeddings.shape
+            # token_embeddings = token_embeddings.flatten(0,1).permute(0, 3, 1, 2) # [B*T, 3*v_dim, p, p]
+            
+    # def unpatchify(self, x):
+    #     """
+    #     x: (N, T, D)
+    #     imgs: (N, C, H, W, D)
+    #     """
+    #     bsz, T, _ = x.shape
+    #     x = x.flatten(0, 1)[:, :, None, None] # [B*T, D, 1, 1]
+    #     x = self.patch_unembed(x) # [B*T, 3*embed_dim, p, p]
+    #     x = x.view(bsz, T, 3, self.config.vocab_embed_dim, self.config.patch_size, self.config.patch_size) # [B, T, 3, embed_dim, p, p]
+    #     x = torch.einsum('btcepq->btcpqe', x) # [B, T, 3, p, p, embed_dim]
+    #     # c = 3
+    #     # p = self.config.patch_size
+    #     # h_ = w_ = int(x.shape[1] ** 0.5)
+
+        # # x = x.reshape(shape=(x.shape[0], h_, w_, p, p, c, 256))
+        # # x = torch.einsum('nhwpqcd->nchpwqd', x).contiguous()
+        # # x = x.view(size=(x.shape[0], c, h_ * p, w_ * p, 256))
+        # return x
+
+# def patchify(self, x):
+    #     bsz, c, h, w = x.shape
+    #     p = self.config.patch_size
+    #     h_, w_ = h // p, w // p
+
+    #     x = x.reshape(bsz, c, h_, p, w_, p)
+    #     x = torch.einsum('nchpwq->nhwcpq', x)
+    #     x = x.reshape(bsz, h_ * w_, c * p ** 2)
+    #     x = self.inp_proj(x)
+    #     return x  # [n, l, d]  
+
+        # self.patch_unembed = nn.ConvTranspose2d(config.dim, 3*config.vocab_embed_dim, kernel_size=config.patch_size, stride=config.patch_size, bias=False)
 
 #################################################################################
 #                      Embedding Layers for Class Labels                        #
@@ -284,18 +299,7 @@ class FeedForward(nn.Module):
         self.ffn_dropout = nn.Dropout(config.ffn_dropout_p)
 
     def forward(self, x):
-        hidden = F.silu(self.w1(x)) * self.w3(x)
-
-        w2_dtype = self.w2.weight.dtype
-        if hidden.dtype != w2_dtype:
-            hidden = hidden.to(dtype=w2_dtype)
-
-        out = self.w2(hidden)
-
-        if out.dtype != x.dtype:
-            out = out.to(dtype=x.dtype)
-
-        return self.ffn_dropout(out)
+        return self.ffn_dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 
 class KVCache(nn.Module):
@@ -310,14 +314,14 @@ class KVCache(nn.Module):
         assert input_pos.shape[0] == k_val.shape[2]
         k_out = self.k_cache
         v_out = self.v_cache
-        k_out[:, :, input_pos] = k_val.float()
-        v_out[:, :, input_pos] = v_val.float()
+        k_out[:, :, input_pos] = k_val
+        v_out[:, :, input_pos] = v_val
 
         return k_out, v_out
 
 
 class Attention(nn.Module):
-    def __init__(self, config: ModelArgs, packed_inputs: bool = False):
+    def __init__(self, config: ModelArgs):
         super().__init__()
         assert config.dim % config.n_head == 0
         self.dim = config.dim
@@ -325,7 +329,6 @@ class Attention(nn.Module):
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head if config.n_kv_head is not None else config.n_head
         total_kv_dim = (self.n_head + 2 * self.n_kv_head) * self.head_dim
-        self.packed_inputs = packed_inputs
 
         # key, query, value projections for all heads, but in a batch
         self.wqkv = nn.Linear(config.dim, total_kv_dim, bias=False)
@@ -337,18 +340,10 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(config.resid_dropout_p)
 
     def forward(
-        self, x, freqs_cis, *args, **kwargs
-    ):
-        if self.packed_inputs:
-            return self._forward_packed(x, freqs_cis, *args, **kwargs)
-        else:
-            return self._forward_simple(x, freqs_cis, *args, **kwargs)
-
-    def _forward_simple(
-        self, x: torch.Tensor, freqs_cis: torch.Tensor, 
+        self, x: torch.Tensor, freqs_cis: torch.Tensor = None, 
         input_pos: Optional[torch.Tensor] = None, 
         mask: Optional[torch.Tensor] = None,
-        attn_impl: str = "xformers",
+        attn_impl: str = "xformers"
     ):
         bsz, seqlen, _ = x.shape
         kv_size = self.n_kv_head * self.head_dim
@@ -395,68 +390,21 @@ class Attention(nn.Module):
         output = self.resid_dropout(self.wo(output))
         return output
 
-    def _forward_packed(
-        self, x: torch.Tensor, freqs_cis: torch.Tensor, seqlens: torch.Tensor
-    ):
-        T, dim = x.shape
-        kv_size = self.n_kv_head * self.head_dim
-        xq, xk, xv = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)  # each [T, D]
-
-        # reshape to [T, H, Hd] for xformers
-        def split_heads(x: torch.Tensor) -> torch.Tensor:
-            return x.view(1, T, self.n_head, self.head_dim).contiguous()
-        xq, xk, xv = split_heads(xq), split_heads(xk), split_heads(xv)
-        
-        # apply rotatory embeddings
-        xq = apply_rotary_emb(xq, freqs_cis)
-        xk = apply_rotary_emb(xk, freqs_cis)
-
-        # attention
-        output = _call_xformers_attention(
-            seqlens,
-            xq=xq,
-            xk=xk,
-            xv=xv,
-            attn_dropout_p=self.attn_dropout_p if self.training else 0.0,
-        )  # [1, T, H, Hd]
-
-        # reshape and ffn
-        output = output.contiguous().view(T, dim)
-        output = self.resid_dropout(self.wo(output))
-
-        return output
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config: ModelArgs, drop_path: float, packed_inputs: bool = False):
+    def __init__(self, config: ModelArgs, drop_path: float):
         super().__init__()
-        self.attention = Attention(config, packed_inputs=packed_inputs)
+        self.attention = Attention(config)
         self.feed_forward = FeedForward(config)
         self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.packed_inputs = packed_inputs
 
     def forward(
-        self, x, freqs_cis, *args, **kwargs
-    ):
-        if self.packed_inputs:
-            return self._forward_packed(x, freqs_cis, *args, **kwargs)
-        else:
-            return self._forward_simple(x, freqs_cis, *args, **kwargs)
-
-    def _forward_packed(
-        self, x: torch.Tensor, freqs_cis: torch.Tensor, seqlens: torch.Tensor
-    ):
-        h = x + self.drop_path(self.attention(self.attention_norm(x), freqs_cis, seqlens))
-        out = h + self.drop_path(self.feed_forward(self.ffn_norm(h)))
-        return out
-
-    def _forward_simple(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int, mask: Optional[torch.Tensor] = None, attn_impl: str = "xformers"):
         h = x + self.drop_path(self.attention(self.attention_norm(x), freqs_cis, start_pos, mask, attn_impl=attn_impl))
         out = h + self.drop_path(self.feed_forward(self.ffn_norm(h)))
         return out
-
 
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs):
@@ -472,24 +420,33 @@ class Transformer(nn.Module):
             self.cls_embedding = LabelEmbedder(config.num_classes, config.dim, config.class_dropout_prob)
         elif self.model_type == 't2i':
             self.cls_embedding = CaptionEmbedder(config.caption_dim, config.dim, config.class_dropout_prob)
-        elif self.model_type == "ucond":
-            assert self.cls_token_num == 0, "cls_token_num must be 0 for ucond model"
-            self.cls_embedding = UcondEmbedder(hidden_size=config.dim)
         else:
             raise Exception("please check model type")
-        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
-        self.tok_dropout = nn.Dropout(config.token_dropout_p)
-        self.packed_inputs = config.packed_inputs
+        
+        # pixel embeddings
+        self.r_embeddings = nn.Embedding(config.vocab_size, config.vocab_embed_dim)
+        self.g_embeddings = nn.Embedding(config.vocab_size, config.vocab_embed_dim)
+        self.b_embeddings = nn.Embedding(config.vocab_size, config.vocab_embed_dim)
+        
+        # patch embedding
+        if config.patchifier == 'linear':
+            self.patchifier = LinearPatchifier(config.patch_size, config.vocab_embed_dim, config.dim)
+        elif config.patchifier == 'cnn':
+            self.patchifier = CNNPatchifier(config.patch_size, config.vocab_embed_dim, config.dim)
+        else:
+            raise Exception("please check patchifier type")
+        print(f"Using {config.patchifier} patchifier for GPT model.")
 
         # transformer blocks
+        self.tok_dropout = nn.Dropout(config.token_dropout_p)
         dpr = [x.item() for x in torch.linspace(0, config.drop_path_rate, config.n_layer)]
         self.layers = torch.nn.ModuleList()
         for layer_id in range(config.n_layer):
-            self.layers.append(TransformerBlock(config, dpr[layer_id], packed_inputs=self.packed_inputs))
+            self.layers.append(TransformerBlock(config, dpr[layer_id]))
 
         # output layer
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
-        self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+        self.final = nn.Linear(config.vocab_embed_dim, config.vocab_size, bias=False)
 
         # 2d rotary pos embedding
         grid_size = int(self.block_size ** 0.5)
@@ -506,8 +463,6 @@ class Transformer(nn.Module):
         # Initialize nn.Linear and nn.Embedding
         self.apply(self._init_weights)
 
-        # Zero-out output layers:
-        nn.init.constant_(self.output.weight, 0)
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -534,37 +489,34 @@ class Transformer(nn.Module):
         assert grid_size * grid_size == self.block_size
         self.freqs_cis = precompute_freqs_cis_2d(grid_size, self.config.dim // self.config.n_head, self.config.rope_base, self.cls_token_num)
 
+    
+    
     def forward(
-        self,
-        idx: torch.Tensor, 
-        cond_idx: torch.Tensor,  # cond_idx_or_embed
-        targets: Optional[torch.Tensor] = None,
-        *args,
-        **kwargs
-    ):
-        if self.packed_inputs:
-            assert targets is not None, f"packing is currently only valid for training"
-            output = self._forward_packed(idx, cond_idx, targets, *args, **kwargs)
-            return output
-        else:
-            return self._forward_simple(idx, cond_idx, targets, *args, **kwargs)
-
-
-    def _forward_simple(
         self, 
-        idx: torch.Tensor, 
+        idx: torch.Tensor, # [B, T, 3, p, p]
         cond_idx: torch.Tensor,  # cond_idx_or_embed
+        input_pos:  Optional[torch.Tensor] = None, 
         targets: Optional[torch.Tensor] = None,
-        input_pos:  Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
         valid: Optional[torch.Tensor] = None,
         attn_impl: str = "xformers",
     ):
         if idx is not None and cond_idx is not None: # training or naive inference
             cond_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
-            token_embeddings = self.tok_embeddings(idx)
-            token_embeddings = torch.cat((cond_embeddings, token_embeddings), dim=1)
+            
+            # embeddings
+            token_embeddings_r = self.r_embeddings(idx[:, :, 0]) # [B, T, p, p, v_dim]
+            token_embeddings_g = self.g_embeddings(idx[:, :, 1]) # [B, T, p, p, v_dim]
+            token_embeddings_b = self.b_embeddings(idx[:, :, 2]) # [B, T, p, p, v_dim]
+            token_embeddings = torch.cat((token_embeddings_r, token_embeddings_g, token_embeddings_b), dim=-1) # [B, T, p, p, 3*v_dim]
+            
+            token_embeddings = self.patchifier.patchify(token_embeddings) # [B, T, D]
+            
+            # add class condition
+            # token_embeddings = torch.randn(idx.shape[0], 255, self.config.dim, device=idx.device) # dummy input for patch embedding
+            token_embeddings = torch.cat((cond_embeddings, token_embeddings), dim=1) # [B, T, D]
             h = self.tok_dropout(token_embeddings)
+            self.freqs_cis = self.freqs_cis.to(h.device)
         else:
             if cond_idx is not None: # prefill in inference
                 token_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
@@ -576,7 +528,7 @@ class Transformer(nn.Module):
             h = self.tok_dropout(token_embeddings)
             self.freqs_cis = self.freqs_cis
         
-        if self.training or input_pos is None:
+        if self.training:
             freqs_cis = self.freqs_cis[:token_embeddings.shape[1]]
         else:
             freqs_cis = self.freqs_cis[input_pos]
@@ -585,11 +537,14 @@ class Transformer(nn.Module):
             h = layer(h, freqs_cis, input_pos, mask, attn_impl=attn_impl)
         
         # output layers
-        h = self.norm(h)
-        logits = self.output(h).float()
+        h = self.norm(h)        
+        h = self.patchifier.unpatchify(h) # [B, T, 3, p, p, v_dim]
+        logits = self.final(h).float()
+        # import ipdb; ipdb.set_trace()
+        # logits = h[:, :, :8].float()
         
         if self.training:
-            logits = logits[:, max(0, self.cls_token_num - 1):].contiguous()
+            logits = logits[:, self.cls_token_num - 1:].contiguous()
 
         # if we are given some desired targets also calculate the loss
         loss = None
@@ -598,44 +553,19 @@ class Transformer(nn.Module):
             valid_all = valid[:,None].repeat(1, targets.shape[1]).view(-1)
             loss = (loss_all * valid_all).sum() / max(valid_all.sum(), 1)
         elif targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.contiguous().view(-1))
-
-        return logits, loss
-    
-    def _forward_packed(
-        self, 
-        idx: torch.Tensor, 
-        cond_idx: torch.Tensor,  # cond_idx_or_embed
-        targets: torch.Tensor,
-        seqlens: torch.Tensor,
-    ):
-        assert self.cls_token_num == 1, f"Only 1 class token number is supported"
-
-        # create token embeddings
-        cond_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num].view(-1, self.config.dim)
-        token_embeddings = self.tok_embeddings(idx)
-
-        # add condition emebddings
-        seqlens = seqlens + 1
-        start_pos = torch.cumsum(seqlens, dim=-1) - seqlens
-        token_embeddings = scatter_at_pos(token_embeddings, cond_embeddings, start_pos)
-
-        # token dropout
-        h = self.tok_dropout(token_embeddings)
-
-        # freq embeddings
-        _freqs_cis = map_pos_to_freq(seqlens, self.freqs_cis)
-        
-        # transformer blocks
-        for layer in self.layers:
-            h = layer(h, _freqs_cis, seqlens=seqlens)
-        
-        # output layers
-        h = self.norm(h)
-        logits = self.output(h).float()
-
-        # if we are given some desired targets also calculate the loss
-        loss = F.cross_entropy(logits, targets)
+            # hardmining 
+            # find the GT with most uncertainty (lowest confidence) and calculate loss only on those tokens
+            # logits = logits.view(logits.shape[0], -1, logits.shape[-1]) # [B, T, vocab_size]
+            # targets = targets.view(targets.shape[0], -1) # [B, T]
+            # with torch.no_grad():
+            #     gt_confidence = F.softmax(logits, dim=-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1) # [B, 3*H*W]
+            #     k = int(gt_confidence.shape[-1] * 0.25)
+            #     _, hard_indices = torch.topk(-gt_confidence.view(gt_confidence.shape[0], -1), k, dim=-1) # [B, k]
+            # logits = logits[torch.arange(logits.shape[0])[:, None], hard_indices] # [B, k, vocab_size]
+            # targets = targets[torch.arange(targets.shape[0])[:, None], hard_indices]
+            # loss = torch.tensor(0.0, device=h.device, requires_grad=True)
+            # logits = loss
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1).to(torch.long))
 
         return logits, loss
 
@@ -682,9 +612,8 @@ def precompute_freqs_cis_2d(grid_size: int, n_elem: int, base: int = 10000, cls_
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor):
     # x: (bs, seq_len, n_head, head_dim)
     # freqs_cis (seq_len, head_dim // 2, 2)
-    xshaped = x.float().reshape(*x.shape[:-1], x.shape[-1] // 2, 2) # (bs, seq_len, n_head, head_dim//2, 2)
-    freqs_cis_bsz = freqs_cis.shape[0] if freqs_cis.dim() == 4 else 1
-    freqs_cis = freqs_cis.view(freqs_cis_bsz, xshaped.size(1), 1, xshaped.size(3), 2) # (bsz, seq_len, 1, head_dim//2, 2)
+    xshaped = x.float().reshape(*x.shape[:-1], -1, 2) # (bs, seq_len, n_head, head_dim//2, 2)
+    freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2) # (1, seq_len, 1, head_dim//2, 2)
     x_out2 = torch.stack([
             xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],
             xshaped[..., 1] * freqs_cis[..., 0] + xshaped[..., 0] * freqs_cis[..., 1],
@@ -723,10 +652,8 @@ def GPT_L(**kwargs):
 def GPT_B(**kwargs):
     return Transformer(ModelArgs(n_layer=12, n_head=12, dim=768, **kwargs)) # 111M
         
-def GPT_T(**kwargs):
-    return Transformer(ModelArgs(n_layer=6, n_head=8, dim=512, **kwargs)) # 37M
 
 GPT_models = {
-    'GPT-T': GPT_T, 'GPT-B': GPT_B, 'GPT-L': GPT_L, 'GPT-XL': GPT_XL, 'GPT-XXL': GPT_XXL, 'GPT-XXXL': GPT_XXXL,
+    'GPT-B': GPT_B, 'GPT-L': GPT_L, 'GPT-XL': GPT_XL, 'GPT-XXL': GPT_XXL, 'GPT-XXXL': GPT_XXXL,
     'GPT-1B': GPT_1B, 'GPT-3B': GPT_3B, 'GPT-7B': GPT_7B, 
 }

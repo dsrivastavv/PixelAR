@@ -1,5 +1,5 @@
 # training related parameters
-exp_name: "llamagen"
+exp_name: "pixelar"
 results_dir: "outputs"
 global_seed: 0
 
@@ -10,21 +10,20 @@ model:
   dropout_p: 0.1
   drop_path_rate: 0.0
   token_dropout_p: 0.1
-  vq_model: VQ-16
-  codebook_size: 16384
+  codebook_size: 256
   codebook_embed_dim: 8
   downsample_size: 16
-  vq_ckpt: data/tokenizers/vq_ds16_c2i.pt
+  patchifier: 'cnn' # [linear, cnn]
 
 dataset:
-  code_path: data/res256/imagenet_code_c2i_flip_ten_crop
+  path: data/imagenet/ILSVRC/Data/CLS-LOC/train
   image_size: 256
   num_classes: 1000
 
 accelerator:
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 8
   mixed_precision: bf16
-  inductor_mode: max-autotune-no-cudagraphs
+  inductor_mode: default
 
 optimizer:
   lr: 1e-4
@@ -34,17 +33,14 @@ optimizer:
   max_grad_norm: 1.0
 
 training:
-  num_workers: 16
+  num_workers: 24
   global_batch_size: 256
   epochs: 300
-  wandb:
-    wandb_entity: "LlamaGen"
-    wandb_offline: True
 
 checkpoint:
   log_every: 100
   log_with: wandb
-  visualize_every: 10000 # every 10 log intervals, do one visualization
+  visualize_every: 500 # every 10 log intervals, do one visualization
   visualize_num: 8
   disk_location: null
 

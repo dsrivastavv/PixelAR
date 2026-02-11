@@ -5,12 +5,10 @@
 import gc
 import torch
 
-from PixelAR.dataset.imagenet import CustomDataset
-from PixelAR.dataset.patch_dataset import PatchDataset
+from PixelAR.dataset.imagenet import ImageNetTenCropDataset
 from PixelAR.evaluation.evaluate import evaluate_reconstruction
 from PixelAR.models.gpt import GPT_models
 from PixelAR.models.utils import save_with_retries
-from PixelAR.tokenizer_image.vq_model import VQ_models
 from PixelAR.utils.gpu_monitor import GPUMemoryMonitor
 from PixelAR.utils.logger import create_logger
 
@@ -27,16 +25,6 @@ from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import ProjectConfiguration, TorchDynamoPlugin, set_seed
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
-
-
-def build_imagenet_code(code_path, image_size):
-    feature_dir = f"{code_path}/imagenet{image_size}_codes"
-    label_dir = f"{code_path}/imagenet{image_size}_labels"
-    assert os.path.exists(feature_dir) and os.path.exists(
-        label_dir
-    ), f"please first run: bash scripts/autoregressive/extract_codes_c2i.sh ..."
-    return CustomDataset(feature_dir, label_dir)
-
 
 def flatten_dict(d, parent_key="", sep="_"):
     items = []
@@ -116,10 +104,10 @@ def main(config, uuid=None, debug=False):
 
     # wandb setup
     accelerator.init_trackers(
-        project_name="LLamaGen",
+        project_name="pixelar",
         init_kwargs={
             "wandb": {
-                "entity": config.training.wandb.wandb_entity,
+                "entity": "somm14divi",
                 "config": dict(config),
                 "name": config.exp_name,
                 "dir": experiment_dir,
@@ -155,17 +143,12 @@ def main(config, uuid=None, debug=False):
 
     #################### Data, Model, Optimization ####################
     # setup dataset
-    dataset = build_imagenet_code(config.dataset.code_path, config.dataset.image_size)
-    flip_info = "with" if dataset.flip else "without"
-    aug_info = 10 if "ten_crop" in dataset.feature_dir else 1
-    aug_info = 2 * aug_info if dataset.aug_feature_dir is not None else aug_info
-    logger.info(
-        f"Dataset contains {len(dataset):,} images ({config.dataset.code_path}) "
-        f"{flip_info} flip augmentation and {aug_info} crop augmentation"
+    dataset = ImageNetTenCropDataset(
+        config.dataset.path, 
+        image_size=config.dataset.image_size, 
+        ten_crop=True,
+        patch_size=config.model.downsample_size
     )
-    if config.training.packed_inputs:
-        logger.info("Running with packed inputs...")
-        dataset = PatchDataset(dataset)
     per_gpu_batch_size = int(
         config.training.global_batch_size // accelerator.num_processes // config.accelerator.gradient_accumulation_steps
     )
@@ -177,7 +160,7 @@ def main(config, uuid=None, debug=False):
         pin_memory=True,
         drop_last=True,
         persistent_workers=True,
-        prefetch_factor=8,
+        prefetch_factor=2,
     )
 
     # setup model
@@ -186,9 +169,11 @@ def main(config, uuid=None, debug=False):
     else:
         dropout_p = config.model.dropout_p
     latent_size = config.dataset.image_size // config.model.downsample_size
-    assert config.model.cls_token_num >0, "class token number must be greater than 0 for class-conditional generation"
+    assert config.model.cls_token_num > 0, "class token number must be greater than 0 for class-conditional generation"
     model = GPT_models[config.model.gpt_model](
         vocab_size=config.model.codebook_size,
+        vocab_embed_dim=config.model.codebook_embed_dim,
+        patch_size=latent_size,
         block_size=latent_size**2,
         num_classes=config.dataset.num_classes,
         cls_token_num=config.model.cls_token_num,
@@ -197,21 +182,9 @@ def main(config, uuid=None, debug=False):
         ffn_dropout_p=dropout_p,
         drop_path_rate=config.model.drop_path_rate,
         token_dropout_p=config.model.token_dropout_p,
-        packed_inputs=config.training.packed_inputs
+        patchifier=config.model.patchifier,
     ).to(device)
     logger.info(f"GPT Parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    # setup tokenizer
-    vq_model = VQ_models[config.model.vq_model](
-        codebook_size=config.model.codebook_size,
-        codebook_embed_dim=config.model.codebook_embed_dim,
-    )
-    vq_model.to(device)
-    vq_model.eval()
-    checkpoint = torch.load(config.model.vq_ckpt, map_location="cpu")
-    vq_model.load_state_dict(checkpoint["model"])
-    del checkpoint
-    logger.info(f"Image tokenizer is loaded")
 
     # setup optimizer
     optimizer = create_optimizer(
@@ -250,24 +223,15 @@ def main(config, uuid=None, debug=False):
         for batch in data_loader:
             model.train()
             tokens, labels = batch[0], batch[1]
+            tokens = tokens.to(torch.int32)
             
             with accelerator.accumulate(model):
-                idx = tokens[:, :-1]
-                if config.training.packed_inputs:
-                    seqlens = torch.tensor([idx.shape[1]]*idx.shape[0])
-                    logits, loss = model(
-                        idx=idx.contiguous().view(-1), 
-                        cond_idx=labels,
-                        targets=tokens.contiguous().view(-1),
-                        seqlens=seqlens
-                    )
-                else:
-                    logits, loss = model(
-                        idx=idx, 
-                        cond_idx=labels,
-                        targets=tokens,
-                        attn_impl=config.model.attn_impl
-                    )
+                logits, loss = model(
+                    idx=tokens[:, :-1],
+                    cond_idx=labels,
+                    targets=tokens,
+                    attn_impl=config.model.attn_impl
+                )
 
                 # backward pass
                 accelerator.backward(loss)
@@ -334,13 +298,10 @@ def main(config, uuid=None, debug=False):
                 if train_steps % config.checkpoint.visualize_every == 0 and accelerator.is_main_process:
                     logger.info("Visualizing teacher-forcing reconstruction.....")
                     pred_recon_grid, gt_recon_grid = evaluate_reconstruction(
-                        vq_model,
                         logits,
                         tokens,
                         config.checkpoint.visualize_num,
-                        image_size=config.dataset.image_size,
-                        codebook_embed_dim=config.model.codebook_embed_dim,
-                        device=device
+                        patch_size=config.model.downsample_size,
                     )
                     accelerator.log(
                         {
@@ -367,7 +328,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp_name", type=str)
     parser.add_argument("--uuid", type=str)
-    parser.add_argument("--config", type=str, default="configs/baselines/llamagen.yaml")
+    parser.add_argument("--config", type=str, default="configs/main_256_linear.yaml")
 
     # debug mode
     parser.add_argument("--prod", action="store_true")
@@ -383,7 +344,6 @@ if __name__ == "__main__":
     parser.add_argument("--model.attn_impl", type=str, default="xformers")
 
     # training arguments
-    parser.add_argument("--training.packed_inputs", action="store_true")
     parser.add_argument("--training.gradient_checkpointing", action="store_true")
     parser.add_argument("--training.num_workers", type=int)
     parser.add_argument("--training.global_batch_size", type=int)
@@ -393,6 +353,7 @@ if __name__ == "__main__":
     parser.add_argument("--optimizer.lr", type=float)
 
     # visualization arguments
+    parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--checkpoint.log_every", type=int)
     parser.add_argument("--checkpoint.visualize_every", type=int)
     parser.add_argument("--checkpoint.visualize_num", type=int)
@@ -411,9 +372,7 @@ if __name__ == "__main__":
     # merge with script args
     config = OmegaConf.merge(config, cli_cfg)
     
-    # wandb offline
-    os.environ["WANDB__SERVICE_WAIT"] = "600"
-    if config.training.wandb.wandb_offline:
+    if not config.wandb:
         os.environ["WANDB_MODE"] = "offline"
         
     # setup default config values
@@ -432,9 +391,10 @@ if __name__ == "__main__":
         print(
             "----------------------------------------------- RUNNING IN DEBUG MODE ----------------------------------------------"
         )
+        config.accelerator.gradient_accumulation_steps = 1
         config.results_dir = f"{config.results_dir}_debug"
-        config.training.global_batch_size = 256
-        config.checkpoint.visualize_every = 500
+        config.training.global_batch_size = 4
+        config.checkpoint.visualize_every = 100
 
     if config.resume_dir:
         print(f"--------------- Resuming training from {config.resume_dir} -----------")
